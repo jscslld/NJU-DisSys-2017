@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"math/rand"
 	"sync"
+	"time"
 )
 import "dissys_raft/labrpc"
 
@@ -36,9 +38,9 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	Index   int
-	Term    int
-	Command interface{}
+	Index   int         // Index of this log entry in the log
+	Term    int         // Term when the entry was received by the leader
+	Command interface{} // Command for the state machine
 }
 
 // A Go object implementing a single Raft peer.
@@ -51,9 +53,18 @@ type Raft struct {
 	// Your data here.
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm int
-	votedFor    int
-	log         [][]LogEntry
+	currentTerm int        // Latest term server has seen
+	votedFor    int        // CandidateId that received vote in current term (-1 if none)
+	log         []LogEntry // Log entries
+
+	state     string    // "Follower", "Candidate", "Leader"
+	lastHeard time.Time // Last time a heartbeat or valid RPC was received
+
+	applyCh         chan ApplyMsg // Channel to send committed log entries
+	electionTimeout time.Duration
+
+	commitIndex int // Index of highest log entry known to be committed
+	lastApplied int // Index of highest log entry applied to state machine
 }
 
 // return currentTerm and whether this server
@@ -62,7 +73,8 @@ func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
-	// Your code here.
+	term = rf.currentTerm
+	isleader = rf.state == "Leader"
 	return term, isleader
 }
 
@@ -92,23 +104,59 @@ func (rf *Raft) readPersist(data []byte) {
 
 // example RequestVote RPC arguments structure.
 type RequestVoteArgs struct {
-	Term         int // 任期号
-	CandidateId  int // 候选人ID
-	LastLogIndex int //最后一个日志的序号
-	LastLogTerm  int // 最后一个日志的任期
-	// Your data here.
+	Term         int // Candidate's current term
+	CandidateId  int // Candidate requesting the vote (its index in peers[])
+	LastLogIndex int // Index of candidate's last log entry
+	LastLogTerm  int // Term of candidate's last log entry
 }
 
 // example RequestVote RPC reply structure.
 type RequestVoteReply struct {
-	Term        int  // 任期号
-	VoteGranted bool //是否获得投票
-	// Your data here.
+	Term        int  // CurrentTerm, for candidate to update itself if outdated
+	VoteGranted bool // True if candidate received the vote
+}
+
+type AppendEntriesArgs struct {
+	Term         int        // Leader's term
+	LeaderId     int        // Leader's ID
+	PrevLogIndex int        // Index of log entry immediately preceding new entries
+	PrevLogTerm  int        // Term of `PrevLogIndex` entry
+	Entries      []LogEntry // Log entries to store (empty for heartbeat)
+	LeaderCommit int        // Leader's commit index
+}
+
+type AppendEntriesReply struct {
+	Term    int  // Current term, for leader to update itself
+	Success bool // True if follower contained entry matching `PrevLogIndex` and `PrevLogTerm`
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here.
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+	// If term is newer, update to follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = "Follower"
+		rf.votedFor = -1
+	}
+	lastLog := rf.log[len(rf.log)-1]
+	upToDate := args.LastLogTerm > lastLog.Term || (args.LastLogTerm == lastLog.Term && args.LastLogIndex >= lastLog.Index)
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
+		rf.votedFor = args.CandidateId
+		rf.lastHeard = time.Now()
+		reply.VoteGranted = true
+	} else {
+		reply.VoteGranted = false
+	}
+
+	reply.Term = rf.currentTerm
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -158,6 +206,129 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
+func (rf *Raft) runElectionTimer() {
+	for {
+		time.Sleep(10 * time.Millisecond)
+		rf.mu.Lock()
+		if time.Since(rf.lastHeard) > rf.electionTimeout && rf.state != "Leader" {
+			rf.startElection()
+		}
+		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) startElection() {
+	rf.state = "Candidate"
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	rf.lastHeard = time.Now()
+	args := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: len(rf.log) - 1,
+		LastLogTerm:  rf.log[len(rf.log)-1].Term,
+	}
+	voteCount := 1
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(i int) {
+			reply := RequestVoteReply{}
+			if rf.sendRequestVote(i, args, &reply) {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.state = "Follower"
+					rf.votedFor = -1
+					return
+				}
+
+				if reply.VoteGranted && rf.state == "Candidate" {
+					voteCount++
+					if voteCount > len(rf.peers)/2 {
+						rf.state = "Leader"
+					}
+				}
+			}
+		}(i)
+	}
+}
+
+func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) runHeartbeatTimer() {
+	for {
+		time.Sleep(50 * time.Millisecond) // 心跳间隔通常为 50ms 或更小
+		rf.mu.Lock()
+		if rf.state != "Leader" {
+			rf.mu.Unlock()
+			continue
+		}
+		rf.sendHeartbeats()
+		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) sendHeartbeats() {
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(i int) {
+			rf.mu.Lock()
+			args := AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: len(rf.log) - 1,
+				PrevLogTerm:  rf.log[len(rf.log)-1].Term,
+				Entries:      nil, // 空的 Entries 表示心跳
+				LeaderCommit: rf.commitIndex,
+			}
+			rf.mu.Unlock()
+
+			reply := AppendEntriesReply{}
+			if rf.sendAppendEntries(i, args, &reply) {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				if reply.Term > rf.currentTerm {
+					// 检测到自己的任期落后，转为 Follower
+					rf.currentTerm = reply.Term
+					rf.state = "Follower"
+					rf.votedFor = -1
+				}
+			}
+		}(i)
+	}
+}
+
+func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	// 如果 Term 更新，则转为 Follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = "Follower"
+		rf.votedFor = -1
+	}
+	rf.lastHeard = time.Now()
+
+	// 心跳的日志一致性检查通常会忽略，因为 Entries 为空
+	reply.Term = rf.currentTerm
+	reply.Success = true
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -175,9 +346,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here.
-
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.state = "Follower"
+	rf.lastHeard = time.Now()
+	rf.applyCh = applyCh
+	rf.log = []LogEntry{{Index: 0, Term: 0, Command: nil}}
+	rf.electionTimeout = time.Duration(150+rand.Intn(150)) * time.Millisecond
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	go rf.runElectionTimer()
+	go rf.runHeartbeatTimer()
 	return rf
 }
