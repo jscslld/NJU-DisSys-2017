@@ -17,7 +17,9 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"sync"
+)
 import "dissys_raft/labrpc"
 
 // import "bytes"
@@ -33,6 +35,12 @@ type ApplyMsg struct {
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
+type LogEntry struct {
+	Index   int
+	Term    int
+	Command interface{}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex
@@ -43,7 +51,9 @@ type Raft struct {
 	// Your data here.
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	currentTerm int
+	votedFor    int
+	log         [][]LogEntry
 }
 
 // return currentTerm and whether this server
@@ -82,11 +92,17 @@ func (rf *Raft) readPersist(data []byte) {
 
 // example RequestVote RPC arguments structure.
 type RequestVoteArgs struct {
+	Term         int // 任期号
+	CandidateId  int // 候选人ID
+	LastLogIndex int //最后一个日志的序号
+	LastLogTerm  int // 最后一个日志的任期
 	// Your data here.
 }
 
 // example RequestVote RPC reply structure.
 type RequestVoteReply struct {
+	Term        int  // 任期号
+	VoteGranted bool //是否获得投票
 	// Your data here.
 }
 
